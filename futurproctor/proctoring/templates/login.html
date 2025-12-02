@@ -126,7 +126,6 @@
                     <div class="alert alert-warning instructions" role="alert">
                         <h4 class="alert-heading">Instructions for Login:</h4>
                         <ul>
-                            
                             <li>First Click on <strong>Capture Photo</strong> to take a snapshot.</li>
                             <li>Enter your email and password in the login form.</li>
                             <li>Click <strong>Login</strong> to authenticate.</li>
@@ -157,7 +156,8 @@
                             <div class="col-md-6 text-center">
                                 <h5>Face Recognition</h5>
                                 <div class="position-relative">
-                                    <img id="webcam-stream" src="{% url 'video_feed' %}" alt="Video Feed" class="img-fluid rounded shadow">
+                                    <!-- CHANGED: use browser camera instead of /video_feed/ -->
+                                    <video id="webcam-stream" autoplay playsinline class="img-fluid rounded shadow"></video>
                                     <canvas id="canvas" class="d-none"></canvas>
                                 </div>
                                 <button id="take-photo-btn" class="btn btn-info mt-3">Capture Photo</button>
@@ -186,7 +186,7 @@
     <!-- Bootstrap JS and Dependencies -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        const webcamStream = document.getElementById('webcam-stream');
+        const webcamStream = document.getElementById('webcam-stream');  // now a <video>
         const takePhotoBtn = document.getElementById('take-photo-btn');
         const canvas = document.getElementById('canvas');
         const capturedPhoto = document.getElementById('captured-photo');
@@ -197,9 +197,28 @@
 
         let photoCaptured = false;
 
+        // --- Enable browser camera using getUserMedia ---
+        (async function initCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+                webcamStream.srcObject = stream;
+            } catch (err) {
+                console.error('Camera error:', err);
+                errorMessage.textContent = 'Could not access camera: ' + err.name + '. Check browser permissions.';
+                errorMessage.classList.remove('d-none');
+            }
+        })();
+
+        // --- Capture current frame into hidden input ---
         takePhotoBtn.addEventListener('click', () => {
-            canvas.width = webcamStream.width;
-            canvas.height = webcamStream.height;
+            if (!webcamStream.videoWidth || !webcamStream.videoHeight) {
+                errorMessage.textContent = "Camera not ready yet. Wait a second and try again.";
+                errorMessage.classList.remove('d-none');
+                return;
+            }
+
+            canvas.width = webcamStream.videoWidth;
+            canvas.height = webcamStream.videoHeight;
 
             const context = canvas.getContext('2d');
             context.drawImage(webcamStream, 0, 0, canvas.width, canvas.height);
@@ -209,8 +228,12 @@
             capturedPhotoInput.value = photoData;
             photoCaptured = true;
             errorMessage.classList.add('d-none');
+
+            // show preview card
+            document.querySelector('.captured-photo').style.display = 'block';
         });
 
+        // --- Login click: send form + captured photo via fetch ---
         loginBtn.addEventListener('click', (event) => {
             if (!photoCaptured) {
                 event.preventDefault();
@@ -232,14 +255,15 @@
                 .then(response => response.json())
                 .then(data => {
                     if (data.success) {
-                        alert("Welcome, " + data.student_name);
+                        alert("Welcome, " + (data.student_name || 'student'));
                         window.location.href = data.redirect_url;
                     } else {
-                        errorMessage.textContent = data.error;
+                        errorMessage.textContent = data.error || "Login failed.";
                         errorMessage.classList.remove('d-none');
                     }
                 })
                 .catch(error => {
+                    console.error(error);
                     errorMessage.textContent = "An error occurred during login.";
                     errorMessage.classList.remove('d-none');
                 });

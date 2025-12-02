@@ -13,9 +13,11 @@ from django.core.files.base import ContentFile  # Handling in-memory file storag
 import cv2
 import io
 from PIL import Image
+from django.conf import settings
+
 
 # Models
-from .models import Student, Exam, CheatingEvent, CheatingImage, CheatingAudio  # Importing custom models
+from .models import Student, Exam, CheatingEvent, CheatingImage, CheatingAudio, Certificate  # Importing custom models
 
 # External Library Imports
 import os  # Operating system utilities (e.g., file handling)
@@ -26,8 +28,9 @@ import numpy as np  # Numerical operations, especially for image processing
 import cv2  # OpenCV for computer vision tasks (e.g., face recognition)
 import logging  # Logging errors and system activity
 import time  # Time-based operations (e.g., timestamps)
-from PIL import Image  # Image processing using the Pillow library
+from PIL import Image, ImageDraw, ImageFont  # Image processing using the Pillow library
 import io  # Handling in-memory file operations
+import qrcode  # QR code generation for certificate authenticity
 
 # Machine Learning Imports (Custom AI Models for Proctoring)
 from .ml_models.object_detection import detectObject  # Detecting objects in the exam environment
@@ -42,6 +45,9 @@ import face_recognition  # Used for facial recognition, comparing student faces 
 # Fix: Proper datetime handling for Nepal Time Zone (Asia/Kathmandu)
 import pytz  # For timezone handling
 from datetime import datetime  # Standard date and time handling
+def registration(request):
+    return render(request, "registration.html")
+
 
 # Define Nepal Time Zone
 NEPAL_TZ = pytz.timezone('Asia/Kathmandu')
@@ -239,55 +245,47 @@ def logout_view(request):
     return redirect('home')  # Redirect to the home page
 
 # Video feed generation for the webcam
-def gen_frames():
+# Video feed generation for the webcam + cheating detection
+def gen_frames(request):
     """
-    Generates a live video feed from the webcam.
-    - Captures frames from the webcam using OpenCV.
-    - Encodes each frame as a JPEG image.
-    - Yields the frames as a streaming response for real-time display in the browser.
+    Single webcam stream:
+    - Reads frames from camera
+    - Runs cheating detection on each frame
+    - Streams frames to browser
     """
-    camera = cv2.VideoCapture(0)  # Open the default webcam (index 0)
-    if not camera.isOpened():  # Check if the webcam was successfully opened
-        raise RuntimeError("Could not open webcam.")
+    global warning
 
-    while True:
-        success, frame = camera.read()  # Read a frame from the webcam
+    camera = cv2.VideoCapture(0)  # open default webcam
+    if not camera.isOpened():
+        logger.error("Could not open webcam in gen_frames().")
+        return
+
+    while not stop_event.is_set():
+        success, frame = camera.read()
         if not success:
-            break  # Exit the loop if the frame cannot be read
+            logger.error("Failed to read frame from webcam.")
+            break
 
-        # Encode the frame as a JPEG image
-        _, buffer = cv2.imencode('.jpg', frame)
-        frame = buffer.tobytes()  # Convert the frame to bytes
+        # Run cheating detection on this frame
+        try:
+            process_frame(frame, request)
+        except Exception as e:
+            logger.error(f"Error in process_frame: {e}")
 
-        # Yield the frame as part of a streaming response
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        # Encode frame for streaming
+        ret, buffer = cv2.imencode('.jpg', frame)
+        if not ret:
+            logger.error("Failed to encode frame.")
+            continue
 
-    # Release the webcam when the loop ends
+        frame_bytes = buffer.tobytes()
+        yield (
+            b'--frame\r\n'
+            b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n'
+        )
+
     camera.release()
-
-
-# Video feed view
-def video_feed(request):
-    """
-    Streams the live video feed to the browser.
-    - Uses the `gen_frames` generator to fetch frames from the webcam.
-    - Returns a `StreamingHttpResponse` with the appropriate content type for real-time video streaming.
-    """
-    return StreamingHttpResponse(
-        gen_frames(),  # Use the generator to stream frames
-        content_type='multipart/x-mixed-replace; boundary=frame'  # Required for live video streaming
-    )
-
-
-# Stop video feed view
-def stop_event(request):
-    """
-    Dummy endpoint for stopping the video feed.
-    - Can be extended to handle cleanup or other actions when the video feed is stopped.
-    - Returns a JSON response indicating success.
-    """
-    return JsonResponse({'status': 'success'})  # Simple response for stopping the video feed
+    logger.info("Webcam released in gen_frames()")
 
 #Dashboard View
 @login_required
@@ -370,6 +368,52 @@ def process_frame(frame, request):
             event_type="gaze_detected"
         )
         save_cheating_event(frame, request, cheating_event, detected_objects)
+
+def video_feed(request):
+    """
+    Streams the live video feed (with cheating detection) to the browser.
+    """
+    return StreamingHttpResponse(
+        gen_frames(request),
+        content_type='multipart/x-mixed-replace; boundary=frame'
+    )
+
+
+# Accept frames streamed from the browser camera
+@login_required
+def upload_frame(request):
+    """
+    Receives a base64-encoded frame from the browser, decodes it,
+    runs cheating detection, and returns the latest warning (if any).
+    """
+    global warning
+
+    if request.method != "POST":
+        return JsonResponse({"error": "Invalid request method."}, status=405)
+
+    if stop_event.is_set():
+        return JsonResponse({"status": "stopped"})
+
+    frame_data = request.POST.get("frame")
+    if not frame_data:
+        return JsonResponse({"error": "No frame data provided."}, status=400)
+
+    try:
+        # Strip data URL prefix if present and decode
+        _, encoded = frame_data.split(",", 1)
+        image_bytes = base64.b64decode(encoded)
+        np_frame = np.frombuffer(image_bytes, np.uint8)
+        frame = cv2.imdecode(np_frame, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise ValueError("Frame decode returned None")
+
+        process_frame(frame, request)
+    except Exception as exc:  # Broad catch to keep the stream alive
+        logger.error(f"Failed to process uploaded frame: {exc}")
+        return JsonResponse({"error": "Failed to process frame."}, status=400)
+
+    return JsonResponse({"status": "ok", "warning": warning})
+
 
 # Function to process audio
 def process_audio(request):
@@ -485,58 +529,75 @@ def save_cheating_event(frame, request, cheating_event, detected_objects=None, a
         logger.error(f"Error saving cheating event: {e}")
 
 ## Exam Page View
+## Exam Page View
 @login_required
 def exam(request):
-    """Start the exam and initialize proctoring."""
-    try:
-        # Get the Student instance associated with the logged-in user
-        student = request.user.student
-    except Student.DoesNotExist:
-        # Handle the case where the user does not have a linked Student instance
-        return HttpResponse("Student profile not found. Please contact support.", status=404)
+    """
+    Renders the exam page and starts proctoring:
+    - Loads questions from ai.json
+    - Resets stop_event
+    - Starts background audio detection thread
+    - Video + visual cheating detection run inside video_feed/gen_frames
+    """
+    # Ensure student exists
+    student = request.user.student
 
-    # Get the tab switch count from the CheatingEvent model
-    violations = CheatingEvent.objects.filter(student=student).first()
-    tab_count = violations.tab_switch_count if violations else 0
+    # Path to questions JSON
+    json_path = os.path.join(
+        settings.BASE_DIR,        # futurproctor/
+        "proctoring",             # proctoring/
+        "dummy_data",             # dummy_data/
+        "ai.json"                 # ai.json
+    )
 
-    # Load exam questions from the JSON file
+    print("DEBUG JSON PATH:", json_path)
+
     try:
-        with open("D://Futurproctor//futurproctor//proctoring//dummy_data//ai.json") as file:
+        with open(json_path, "r", encoding="utf-8") as file:
             data = json.load(file)
-        questions = data.get("questions", [])
+            questions = data.get("questions", [])
+
     except FileNotFoundError:
-        return HttpResponse("Error: Questions file not found!", status=404)
+        return HttpResponse(f"Error: Questions file not found at {json_path}", status=404)
+
     except json.JSONDecodeError:
-        return HttpResponse("Error: Failed to parse the questions file!", status=400)
+        return HttpResponse("Error: Invalid JSON format", status=500)
 
-    # Start background processing threads for video and audio monitoring
+    # ✅ Start proctoring: reset stop_event and launch audio thread
     global stop_event
-    stop_event.clear()  # Reset the stop event flag
-    threading.Thread(target=background_processing, args=(request,), daemon=True).start()
+    stop_event.clear()
     threading.Thread(target=process_audio, args=(request,), daemon=True).start()
+    # Note: video + process_frame run via /video_feed/, not a separate thread
 
-    # Render the exam template with questions and tab count
-    return render(request, 'exam.html', {
-        'questions': questions,
-        'warning': warning,
-        'tab_count': tab_count,
+    return render(request, "exam.html", {
+        "questions": questions,
+        "warning": warning,
     })
 
 # Submit exam
+
+
 @login_required
 def submit_exam(request):
     if request.method == 'POST':
-        # Stop the background threads
+        # Stop proctoring threads
         global stop_event
         stop_event.set()
         user = request.user
 
-        # Load questions from ai.json
+        # ✅ Use BASE_DIR instead of hard-coded Windows path
+        json_path = os.path.join(
+            settings.BASE_DIR,
+            "proctoring",
+            "dummy_data",
+            "ai.json",
+        )
+
         try:
-            with open('D:\\Futurproctor\\futurproctor\\proctoring\\dummy_data\\ai.json', 'r') as file:
+            with open(json_path, "r", encoding="utf-8") as file:
                 data = json.load(file)
         except FileNotFoundError:
-            return HttpResponse("Error: Questions file not found!", status=404)
+            return HttpResponse(f"Error: Questions file not found at {json_path}!", status=404)
         except json.JSONDecodeError:
             return HttpResponse("Error: Failed to parse the questions file!", status=400)
 
@@ -546,8 +607,8 @@ def submit_exam(request):
 
         # Check answers
         for question in questions:
-            question_id = question['id']
-            user_answer = request.POST.get(f'answer_{question_id}')
+            qid = question['id']
+            user_answer = request.POST.get(f'answer_{qid}')
             if user_answer == question['correct_answer']:
                 correct_answers += 1
 
@@ -560,20 +621,11 @@ def submit_exam(request):
         )
         exam.save()
 
-        # Redirect to success page
         messages.success(request, 'You have successfully completed the exam!')
         return redirect('exam_submission_success')
 
     return HttpResponse("Invalid request method.", status=400)
 
-# Tab switch tracking
-stop_event = threading.Event()
-
-
-# Set up logging
-logger = logging.getLogger(__name__)
-
-# Tab switch tracking View
 @login_required
 def record_tab_switch(request):
     if request.method == "POST":
@@ -693,14 +745,94 @@ def logout(request):
 from django.shortcuts import render, get_object_or_404
 from django.db.models import Count, Sum
 from django.contrib.admin.views.decorators import staff_member_required
-from .models import Student, Exam, CheatingEvent, CheatingImage, CheatingAudio
+from .models import Student, Exam, CheatingEvent, CheatingImage, CheatingAudio, Certificate
+
+
+def _load_font(size, fallback=ImageFont.load_default()):
+    """Try to load a nicer font if available, otherwise fallback."""
+    try:
+        # DejaVuSans is bundled with Pillow in most installs
+        return ImageFont.truetype("DejaVuSans.ttf", size)
+    except Exception:
+        return fallback
+
+
+def generate_certificate_image(student, exam, verification_url):
+    """
+    Build a more polished certificate image with a QR code for authenticity.
+    """
+    width, height = 1600, 1100
+    bg_color = (255, 255, 255)
+    primary = (40, 55, 90)          # Deep navy for headings
+    accent = (191, 146, 38)         # Gold accent
+    text_color = (45, 45, 45)
+
+    img = Image.new("RGB", (width, height), color=bg_color)
+    draw = ImageDraw.Draw(img)
+
+    # Subtle border + corner accents
+    border_thickness = 6
+    draw.rectangle([(40, 40), (width - 40, height - 40)], outline=accent, width=border_thickness)
+    draw.rectangle([(70, 70), (width - 70, height - 70)], outline=primary, width=2)
+
+    # Decorative waves (simple lines)
+    for offset in range(0, 140, 20):
+        draw.arc([(80 - offset, 80 - offset), (200 + offset, 200 + offset)], start=20, end=340, fill=accent, width=2)
+        draw.arc([(width - 200 - offset, height - 200 - offset), (width - 80 + offset, height - 80 + offset)],
+                 start=200, end=520, fill=accent, width=2)
+
+    # Fonts (name bold and large)
+    title_font = _load_font(70)
+    subtitle_font = _load_font(44)
+    award_font = _load_font(30)
+    name_font = _load_font(84)
+    body_font = _load_font(28)
+    small_font = _load_font(22)
+
+    # Header text
+    draw.text((width // 2, 170), "CERTIFICATE", fill=primary, anchor="ms", font=title_font)
+    draw.text((width // 2, 240), "OF APPRECIATION", fill=accent, anchor="ms", font=subtitle_font)
+    draw.text((width // 2, 320), "THE FOLLOWING AWARD IS GIVEN TO", fill=primary, anchor="ms", font=award_font)
+
+    # Recipient
+    draw.text((width // 2, 420), student.name, fill=primary, anchor="ms", font=name_font)
+
+    # Summary line
+    exam_name = exam.exam_name or "Exam"
+    score = exam.percentage_score if exam.percentage_score is not None else 0
+    summary = f"This certificate is given to {student.name} for completing the {exam_name} with a score of {score}%."
+    draw.text((width // 2, 500), summary, fill=text_color, anchor="ms", font=body_font)
+
+    # Metadata row
+    draw.text((width // 2, 560), f"Issued on: {now().date().isoformat()}", fill=text_color, anchor="ms", font=small_font)
+    draw.text((width // 2, 600), f"Student ID: {student.id}", fill=text_color, anchor="ms", font=small_font)
+
+    # Signatures placeholders
+    draw.line([(width * 0.22, 780), (width * 0.42, 780)], fill=accent, width=3)
+    draw.text((width * 0.32, 810), "Head of Event", fill=text_color, anchor="ms", font=small_font)
+    draw.line([(width * 0.58, 780), (width * 0.78, 780)], fill=accent, width=3)
+    draw.text((width * 0.68, 810), "Mentor", fill=text_color, anchor="ms", font=small_font)
+
+    # QR code for authenticity
+    qr = qrcode.QRCode(box_size=10, border=2)
+    qr.add_data(verification_url)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color=primary, back_color="white").convert("RGB")
+    qr_size = 220
+    qr_img = qr_img.resize((qr_size, qr_size))
+    img.paste(qr_img, (width - qr_size - 140, height - qr_size - 180))
+    draw.text((width - qr_size - 140, height - qr_size - 200), "Scan to verify", fill=text_color, anchor="lb", font=small_font)
+
+    return img
+
+
 @staff_member_required(login_url='/admin/login/')
 def admin_dashboard(request):
     # Fetch students with counts for exams and cheating events
     students = Student.objects.annotate(
         exam_count=Count('exams'),
         cheating_event_count=Count('cheating_events')
-    ).prefetch_related('exams', 'cheating_events')
+    ).prefetch_related('exams', 'cheating_events', 'certificates')
     
     # Calculate trust score and exam scores for each student
     for student in students:
@@ -711,6 +843,9 @@ def admin_dashboard(request):
             if exam.total_questions and exam.total_questions > 0 and exam.percentage_score is None:
                 exam.percentage_score = calculate_exam_score(exam)
                 exam.save()
+
+        # Attach latest certificate for easy access in the template
+        student.latest_certificate = student.certificates.order_by('-issued_at').first()
     
     context = {
         'students': students,
@@ -855,3 +990,59 @@ def download_report(request, student_id):
 
 def add_question(request):
     return render(request, 'add_question.html')  # Ensure you have this template
+
+
+@staff_member_required(login_url='/admin/login/')
+def issue_certificate(request, student_id):
+    """Generate and store a certificate for the latest exam of a student."""
+    student = get_object_or_404(Student, id=student_id)
+    exam = student.exams.order_by('-timestamp').first()
+
+    if not exam:
+        messages.error(request, "No exam found for this student.")
+        return redirect('admin_dashboard')
+
+    if exam.percentage_score is None:
+        exam.calculate_percentage()
+
+    # Create certificate record first to generate a verification URL (file may be blank/null)
+    certificate = Certificate.objects.create(student=student, exam=exam, issued_by=request.user)
+
+    verification_url = request.build_absolute_uri(
+        reverse('verify_certificate', args=[certificate.id])
+    )
+
+    # Build certificate image and save
+    cert_image = generate_certificate_image(student, exam, verification_url)
+    buffer = io.BytesIO()
+    cert_image.save(buffer, format="PNG")
+    image_content = buffer.getvalue()
+
+    certificate.file.save(
+        f"certificate_{student.id}_{int(time.time())}.png",
+        ContentFile(image_content),
+        save=True,
+    )
+
+    messages.success(request, f"Certificate issued for {student.name}.")
+    return redirect('admin_dashboard')
+
+
+@staff_member_required(login_url='/admin/login/')
+def download_certificate(request, certificate_id):
+    """Redirect to the certificate file for viewing/downloading."""
+    certificate = get_object_or_404(Certificate, id=certificate_id)
+    return HttpResponseRedirect(certificate.file.url)
+
+
+def verify_certificate(request, certificate_id):
+    """
+    Simple verification page to confirm authenticity of a certificate.
+    """
+    certificate = get_object_or_404(Certificate.objects.select_related('student', 'exam', 'issued_by'), id=certificate_id)
+    context = {
+        "certificate": certificate,
+        "student": certificate.student,
+        "exam": certificate.exam,
+    }
+    return render(request, "verify_certificate.html", context)

@@ -56,6 +56,7 @@
                                     <th>Exam Name</th>
                                     <th>Score (%)</th>
                                     <th>Trust Score (%)</th>
+                                    <th>Certificate</th>
                                     <th>Actions</th>
                                 </tr>
                             </thead>
@@ -67,6 +68,13 @@
                                     <td>{{ student.exams.first.exam_name|default:"No Exam" }}</td>
                                     <td>{{ student.exams.first.percentage_score|default:"0" }}%</td>
                                     <td>{{ student.trust_score|default:"100" }}%</td>
+                                    <td>
+                                        {% if student.latest_certificate %}
+                                            <a href="{% url 'download_certificate' student.latest_certificate.id %}" class="btn btn-outline-success btn-sm">View</a>
+                                        {% else %}
+                                            <a href="{% url 'issue_certificate' student.id %}" class="btn btn-success btn-sm">Issue</a>
+                                        {% endif %}
+                                    </td>
                                     <td>
                                         <a href="{% url 'report_page' student.id %}" class="btn btn-outline-primary btn-sm me-1">View Report</a>
                                         <a href="#" class="btn btn-outline-warning btn-sm me-1">Edit</a>

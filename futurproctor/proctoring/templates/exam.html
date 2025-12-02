@@ -61,6 +61,39 @@
           </p>
         </div>
 
+        <!-- Live Proctoring Status -->
+        <div class="card shadow-sm mb-4">
+          <div class="card-header bg-dark text-white d-flex justify-content-between align-items-center">
+            <span>Live Proctoring</span>
+            <span class="badge bg-success">Camera &amp; Mic Active</span>
+          </div>
+          <div class="card-body">
+            <div class="row g-3">
+              <div class="col-md-7 text-center">
+                <video
+                  id="proctor-video"
+                  autoplay
+                  playsinline
+                  muted
+                  class="img-fluid rounded border"
+                  style="max-height: 260px; object-fit: cover;"
+                ></video>
+                <canvas id="frame-canvas" style="display: none;"></canvas>
+                <p class="text-muted small mt-2 mb-0">
+                  Your webcam stream is being analyzed for faces, gaze and unauthorized objects.
+                </p>
+              </div>
+              <div class="col-md-5">
+                <div class="alert alert-info mb-2">
+                  <strong>Heads up:</strong> Proctoring runs continuously while this page stays open.
+                  Keep your face centered and avoid books, phones, or other people in view.
+                </div>
+                <div class="alert alert-warning mb-0" id="inline-warning" style="display:none;"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <!-- Tab Switch Counter -->
         <div class="alert alert-danger text-center" id="tab-warning">
           Tab Switches: <span id="tab-count">{{ tab_count }},</span>/5
@@ -120,6 +153,13 @@
 
 
   <script>
+    const warningAlert = document.getElementById("warning-alert");
+    const inlineWarning = document.getElementById("inline-warning");
+    const proctorVideo = document.getElementById("proctor-video");
+    const frameCanvas = document.getElementById("frame-canvas");
+    const frameCtx = frameCanvas.getContext("2d");
+    const csrfToken = document.querySelector("[name=csrfmiddlewaretoken]").value;
+
     // Timer Logic
     let totalTime = 5 * 60; // 5 minutes in seconds
     const timerElement = document.getElementById("time");
@@ -128,9 +168,7 @@
       const timer = setInterval(() => {
         const minutes = Math.floor(totalTime / 60);
         const seconds = totalTime % 60;
-        timerElement.textContent = `${minutes}:${
-          seconds < 10 ? "0" : ""
-        }${seconds}`;
+        timerElement.textContent = `${minutes}:${seconds < 10 ? "0" : ""}${seconds}`;
 
         if (totalTime === 0) {
           clearInterval(timer);
@@ -140,7 +178,6 @@
         totalTime--;
       }, 1000);
     }
-    window.onload = startTimer;
 
     // Function to handle option selection
     function selectOption(optionTile, inputId) {
@@ -152,19 +189,76 @@
       document.getElementById(inputId).checked = true;
     }
 
-    // Fetch real-time warnings
-    function checkWarnings() {
-      fetch("/get_warning/")
+    function showWarning(message) {
+      warningAlert.textContent = message;
+      warningAlert.style.display = "block";
+      inlineWarning.textContent = message;
+      inlineWarning.style.display = "block";
+    }
+
+    function clearWarning() {
+      warningAlert.style.display = "none";
+      inlineWarning.style.display = "none";
+    }
+
+    // Enable the browser camera and send frames to the backend for detection
+    async function initCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        proctorVideo.srcObject = stream;
+        startFramePush();
+      } catch (err) {
+        showWarning("Could not access camera: " + err.name + ". Check browser permissions.");
+      }
+    }
+
+    let framePushInterval = null;
+
+    function startFramePush() {
+      if (framePushInterval) return;
+      framePushInterval = setInterval(pushFrameToServer, 2000);
+      pushFrameToServer();
+    }
+
+    function stopFramePush() {
+      if (framePushInterval) {
+        clearInterval(framePushInterval);
+        framePushInterval = null;
+      }
+    }
+
+    function pushFrameToServer() {
+      if (!proctorVideo.videoWidth || !proctorVideo.videoHeight) {
+        return; // Wait for the camera to become ready
+      }
+
+      frameCanvas.width = proctorVideo.videoWidth;
+      frameCanvas.height = proctorVideo.videoHeight;
+      frameCtx.drawImage(proctorVideo, 0, 0, frameCanvas.width, frameCanvas.height);
+      const frameData = frameCanvas.toDataURL("image/jpeg", 0.7);
+
+      fetch("{% url 'upload_frame' %}", {
+        method: "POST",
+        headers: { "X-CSRFToken": csrfToken },
+        body: new URLSearchParams({ frame: frameData }),
+      })
         .then((response) => response.json())
         .then((data) => {
-          if (data.warning) {
-            const warningAlert = document.getElementById("warning-alert");
-            warningAlert.textContent = data.warning;
-            warningAlert.style.display = "block";
+          if (data.status === "stopped") {
+            stopFramePush();
+            return;
           }
+
+          if (data.warning) {
+            showWarning(data.warning);
+          } else {
+            clearWarning();
+          }
+        })
+        .catch(() => {
+          // Ignore transient network errors to keep the UI responsive
         });
     }
-    setInterval(checkWarnings, 5000);
 
     // Prevent right-click
     document.addEventListener("contextmenu", (e) => e.preventDefault());
@@ -183,61 +277,66 @@
       }
     });
 
-    
-      // Enter fullscreen mode
-      document.documentElement.requestFullscreen();
-    
-      // Initialize the tab switch count (defaulting to 0 if not provided)
-      let tabSwitchCount = {{ tab_count|default:0 }};
-      
-      // Keep track of the previous visibility state
-      let lastVisibilityState = document.visibilityState;
-    
-      // Define the tab switch handler
-      function tabSwitchHandler() {
-        // Only count a switch if the page goes from 'visible' to 'hidden'
-        if (lastVisibilityState === 'visible' && document.visibilityState === 'hidden') {
-          tabSwitchCount++;
-          document.getElementById("tab-count").textContent = tabSwitchCount;
-    
-          // Send a POST request to record the tab switch
-          fetch("{% url 'record_tab_switch' %}", {
-            method: "POST",
-            headers: { "X-CSRFToken": "{{ csrf_token }}" },
+    // Enter fullscreen mode
+    document.documentElement.requestFullscreen();
+
+    // Initialize the tab switch count (defaulting to 0 if not provided)
+    let tabSwitchCount = {{ tab_count|default:0 }};
+
+    // Keep track of the previous visibility state
+    let lastVisibilityState = document.visibilityState;
+
+    // Define the tab switch handler
+    function tabSwitchHandler() {
+      // Only count a switch if the page goes from 'visible' to 'hidden'
+      if (lastVisibilityState === "visible" && document.visibilityState === "hidden") {
+        tabSwitchCount++;
+        document.getElementById("tab-count").textContent = tabSwitchCount;
+
+        // Send a POST request to record the tab switch
+        fetch("{% url 'record_tab_switch' %}", {
+          method: "POST",
+          headers: { "X-CSRFToken": "{{ csrf_token }}" },
+        })
+          .then((response) => response.json())
+          .then((data) => {
+            // If termination condition is met, alert and redirect (or submit termination logic)
+            if (data.status === "terminated") {
+              alert(data.message);
+              // Redirect to a termination page or home (ensure you have this URL configured)
+              window.location.href = "{% url 'exam_submission_success' %}";
+            } else {
+              // Optionally alert on each tab switch when exam is ongoing
+              if (tabSwitchCount >= 1) {
+                alert("Warning: Tab switch detected! Total switches: " + tabSwitchCount);
+              }
+            }
           })
-          .then(response => response.json())
-          .then(data => {
-             // If termination condition is met, alert and redirect (or submit termination logic)
-             if (data.status === "terminated") {
-               alert(data.message);
-               // Redirect to a termination page or home (ensure you have this URL configured)
-               window.location.href = "{% url 'exam_submission_success' %}";
-             } else {
-               // Optionally alert on each tab switch when exam is ongoing
-               if (tabSwitchCount >= 1) {
-                 alert("Warning: Tab switch detected! Total switches: " + tabSwitchCount);
-               }
-             }
-          })
-          .catch(error => console.error('Error:', error));
-        }
-        // Update the last known visibility state
-        lastVisibilityState = document.visibilityState;
+          .catch((error) => console.error("Error:", error));
       }
-    
-      // Listen for visibility changes
-      document.addEventListener("visibilitychange", tabSwitchHandler);
-    
-      // Prevent accidental closing or refreshing of the exam page
-      window.onbeforeunload = function () {
-        return "You are in the middle of an exam! Are you sure you want to leave?";
-      };
-    
-      // When the exam is submitted, remove the event listener and onbeforeunload warning
-      document.getElementById("exam-form").addEventListener("submit", function () {
-        window.onbeforeunload = null;
-        document.removeEventListener("visibilitychange", tabSwitchHandler);
-      });
+      // Update the last known visibility state
+      lastVisibilityState = document.visibilityState;
+    }
+
+    // Listen for visibility changes
+    document.addEventListener("visibilitychange", tabSwitchHandler);
+
+    // Prevent accidental closing or refreshing of the exam page
+    window.onbeforeunload = function () {
+      return "You are in the middle of an exam! Are you sure you want to leave?";
+    };
+
+    // When the exam is submitted, remove the event listener and onbeforeunload warning
+    document.getElementById("exam-form").addEventListener("submit", function () {
+      window.onbeforeunload = null;
+      document.removeEventListener("visibilitychange", tabSwitchHandler);
+      stopFramePush();
+    });
+
+    window.onload = () => {
+      startTimer();
+      initCamera();
+    };
     </script>
     
 </body>

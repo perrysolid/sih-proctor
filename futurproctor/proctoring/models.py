@@ -78,3 +78,14 @@ class CheatingAudio(models.Model):
     event = models.ForeignKey(CheatingEvent, on_delete=models.CASCADE, related_name='cheating_audios')
     audio = models.FileField(upload_to='cheating_audios/', blank=True, null=True)
     timestamp = models.DateTimeField(default=datetime.now())
+
+
+class Certificate(models.Model):
+    student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='certificates')
+    exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name='certificates')
+    issued_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+    issued_at = models.DateTimeField(default=datetime.now())
+    file = models.ImageField(upload_to='certificates/', blank=True, null=True)
+
+    def __str__(self):
+        return f"Certificate for {self.student.name} - {self.exam.exam_name}"
